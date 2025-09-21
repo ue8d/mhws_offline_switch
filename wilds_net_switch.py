@@ -9,7 +9,7 @@ Wilds Net Switch - Monster Hunter Wilds の通信をワンクリックでON/OFF
 import sys, os, json, subprocess, threading, locale, tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 import ctypes, keyboard
-from typing import Callable
+from typing import Callable, Tuple
 
 # ===== 設定 =====
 DEFAULT_GAME_EXE = r""
@@ -97,22 +97,27 @@ def rule_enabled() -> bool:
     if out == "NO_RULE": return False
     return out == "ENABLED"
 
-def create_or_replace_block_rule() -> bool:
-    delete_rule()
+def create_or_replace_block_rule() -> Tuple[bool, str]:
+    # 実行直前にグローバル変数をチェック
+    if not GAME_EXE or not isinstance(GAME_EXE, str):
+        return (False, f"内部エラー: コマンド生成時のGAME_EXE変数が不正です。値: {GAME_EXE}")
+    
+    delete_rule() # 既存ルールがあれば削除
     ps = (
         f"New-NetFirewallRule -DisplayName '{RULE_NAME}' "
         f"-Direction Outbound -Program '{GAME_EXE}' -Action Block -Enabled True"
     )
-    return _run_ps(ps).returncode == 0
+    proc = _run_ps(ps)
+    return (proc.returncode == 0, proc.stderr)
 
-def allow_online() -> bool:
-    # 復帰は規則を削除して確実に戻す
-    return delete_rule()
+def allow_online() -> Tuple[bool, str]:
+    proc = delete_rule()
+    return (proc.returncode == 0, proc.stderr)
 
-def delete_rule() -> bool:
+def delete_rule() -> subprocess.CompletedProcess:
     return _run_ps(
         f"Get-NetFirewallRule -DisplayName '{RULE_NAME}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"
-    ).returncode == 0
+    )
 
 # ---- 小物（中央省略 & ツールチップ） ----
 def ellipsize_middle(text: str, max_chars: int) -> str:
@@ -132,7 +137,7 @@ class Tooltip:
     def _show(self):
         if self.tip: return
         x = self.widget.winfo_rootx() + 10; y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
-        self.tip = tw = tk.Toplevel(self.widget); tw.wm_overrideredirect(True); tw.wm_geometry(f"+{x}+{y}")
+        self.tip = tw = tk.Toplevel(self.widget); tw.wm_overrideredirect(True); tw.wm_geometry(f"{x}+{y}")
         tk.Label(tw, text=self.text, justify="left", background="#FFFFE0",
                  relief="solid", borderwidth=1, font=("Segoe UI", 9)).pack(ipadx=6, ipady=3)
     def _hide(self, _=None): self._cancel()
@@ -320,11 +325,19 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(title="MonsterHunterWilds.exe を選択",
                                           filetypes=[("実行ファイル","*.exe"), ("すべてのファイル","*.*")])
         if not path: return
-        GAME_EXE = path; save_config({"game_exe": GAME_EXE}); self._refresh_path_label()
+        
+        # パスの区切り文字を \ に統一する
+        GAME_EXE = os.path.normpath(path)
+        
+        save_config({"game_exe": GAME_EXE})
+        self._refresh_path_label()
+        
+        # 現在ブロック中なら、新しいパスでルールを再適用する
         try:
             if rule_exists() and rule_enabled():
-                if not create_or_replace_block_rule():
-                    messagebox.showwarning("注意", "新しいパスでブロックルールの再作成に失敗しました。")
+                ok, err = create_or_replace_block_rule()
+                if not ok:
+                    messagebox.showwarning("注意", f"新しいパスでブロックルールの再作成に失敗しました。\n{err.strip()}")
         except Exception as e:
             messagebox.showwarning("注意", f"ルール更新中にエラーが発生しました。\n{e}")
 
@@ -371,37 +384,37 @@ class App(tk.Tk):
         win.protocol("WM_DELETE_WINDOW", cleanup)
         win.after(200, record_key)
 
-
     def on_switch_clicked(self, want_allowed: bool):
         if self._busy: return
-        if not GAME_EXE.lower().endswith(".exe"):
-            messagebox.showerror("設定エラー", "対象の実行ファイルが .exe ではありません。『変更』から選択してください。")
+        # GUI操作の直前にチェック
+        if not GAME_EXE or not GAME_EXE.lower().endswith(".exe"):
+            messagebox.showerror("設定エラー", "対象の実行ファイルが設定されていないか、.exe ファイルではありません。『変更』から選択してください。")
             return
 
         self._start_loading("処理中…数秒お待ちください")
 
         def worker():
-            ok, err = True, None
+            ok, err_detail = True, ""
             try:
                 if want_allowed:
-                    ok = allow_online()            # 復帰は削除で確実に
+                    ok, err_detail = allow_online()
                 else:
-                    ok = create_or_replace_block_rule()
+                    ok, err_detail = create_or_replace_block_rule()
             except Exception as e:
-                ok, err = False, e
+                ok, err_detail = False, str(e)
 
             def finish():
-                # どんな結果でも必ずロック解除
                 self._stop_loading()
-                # 実状態で確定表示
                 try:
                     real_blocked = rule_exists() and rule_enabled()
                     allowed_now = not real_blocked
                 except Exception as e2:
                     messagebox.showwarning("注意", f"状態取得に失敗しました。\n{e2}")
                     allowed_now = want_allowed
+
                 if not ok:
-                    messagebox.showerror("エラー", f"切替に失敗しました。\n{err}" if err else "切替に失敗しました。")
+                    messagebox.showerror("エラー", f"切替に失敗しました。\n\n詳細：\n{err_detail.strip()}" if err_detail else "切替に失敗しました。")
+                
                 self.switch.set_state(allowed_now, animate=True)
                 self._set_ui_text(allowed=allowed_now)
 
@@ -417,13 +430,18 @@ def main():
     except Exception:
         return
     try:
-        subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$PSVersionTable.PSVersion.Major"],
+        # PowerShellが利用可能かチェック
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Write-Host 'OK'"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            encoding="utf-8"
         )
+        if result.returncode != 0 or "OK" not in result.stdout:
+             raise FileNotFoundError("PowerShellが正常に動作しません。")
     except FileNotFoundError:
-        messagebox.showerror("エラー", "PowerShell が見つかりません。"); return
+        messagebox.showerror("エラー", "PowerShell が見つからないか、正常に動作しません。"); return
+
     App().mainloop()
 
 if __name__ == "__main__":
