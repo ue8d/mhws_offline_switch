@@ -4,19 +4,23 @@ Wilds Net Switch - Monster Hunter Wilds の通信をワンクリックでON/OFF
 - 緑=通信許可(オンライン) / 赤=通信ブロック(オフライン)
 - クリック後はローディング表示＆連続クリック防止（完了時に必ず解除）
 - exeパスは「変更」ボタンで差し替え（JSON保存）
+- グローバルショートカット（RegisterHotKey）でバックグラウンドでも反応
+- ★OFFにされたら5秒後に自動でONへ復帰（自分でONに戻したら予約はキャンセル）
+- ★起動時のデフォルト表示は常にオンライン（ON/緑）
 """
 
 import sys, os, json, subprocess, threading, locale, tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 import ctypes, keyboard
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Optional
 
 # ===== 設定 =====
 DEFAULT_GAME_EXE = r""
-DEFAULT_HOTKEY = ""
-RULE_NAME = "BlockWilds_WildsOutbound"
-WINDOW_TITLE = "Wilds Net Switch"
-MAX_PATH_CHARS = 56
+DEFAULT_HOTKEY   = ""  # 例: "ctrl+alt+w"（未設定なら無効）
+RULE_NAME        = "BlockWilds_WildsOutbound"
+WINDOW_TITLE     = "Wilds Net Switch"
+MAX_PATH_CHARS   = 56
+AUTO_REVERT_MS   = 3000  # OFF → ON の自動復帰までの待機時間（ミリ秒）
 # ===============
 
 def _app_dir() -> str:
@@ -43,9 +47,9 @@ def save_config(cfg: dict) -> None:
     except Exception:
         pass
 
-config = load_config()
+config   = load_config()
 GAME_EXE = config.get("game_exe", DEFAULT_GAME_EXE)
-HOTKEY = config.get("hotkey", DEFAULT_HOTKEY)
+HOTKEY   = config.get("hotkey",   DEFAULT_HOTKEY)
 
 # ---- PowerShell / Firewall ----
 def is_admin() -> bool:
@@ -98,11 +102,9 @@ def rule_enabled() -> bool:
     return out == "ENABLED"
 
 def create_or_replace_block_rule() -> Tuple[bool, str]:
-    # 実行直前にグローバル変数をチェック
     if not GAME_EXE or not isinstance(GAME_EXE, str):
-        return (False, f"内部エラー: コマンド生成時のGAME_EXE変数が不正です。値: {GAME_EXE}")
-    
-    delete_rule() # 既存ルールがあれば削除
+        return (False, f"内部エラー: GAME_EXE が未設定か不正です。値: {GAME_EXE}")
+    delete_rule()
     ps = (
         f"New-NetFirewallRule -DisplayName '{RULE_NAME}' "
         f"-Direction Outbound -Program '{GAME_EXE}' -Action Block -Enabled True"
@@ -137,13 +139,71 @@ class Tooltip:
     def _show(self):
         if self.tip: return
         x = self.widget.winfo_rootx() + 10; y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
-        self.tip = tw = tk.Toplevel(self.widget); tw.wm_overrideredirect(True); tw.wm_geometry(f"{x}+{y}")
+        self.tip = tw = tk.Toplevel(self.widget); tw.wm_overrideredirect(True); tw.wm_geometry(f"+{x}+{y}")
         tk.Label(tw, text=self.text, justify="left", background="#FFFFE0",
                  relief="solid", borderwidth=1, font=("Segoe UI", 9)).pack(ipadx=6, ipady=3)
     def _hide(self, _=None): self._cancel()
     def _cancel(self):
         if self._id: self.widget.after_cancel(self._id); self._id = None
         if self.tip: self.tip.destroy(); self.tip = None
+
+# ---- グローバルホットキー（WinAPI） ----
+MOD_ALT=0x0001; MOD_CONTROL=0x0002; MOD_SHIFT=0x0004; MOD_WIN=0x0008; WM_HOTKEY=0x0312
+VK_MAP = {**{chr(c): c for c in range(0x41, 0x5B)},
+          **{str(d): 0x30+d for d in range(10)},
+          **{f"f{i}": 0x70 + (i-1) for i in range(1,13)},
+          "space":0x20,"tab":0x09,"escape":0x1B,"esc":0x1B,
+          "left":0x25,"up":0x26,"right":0x27,"down":0x28,
+          "home":0x24,"end":0x23,"pageup":0x21,"pagedown":0x22,
+          "insert":0x2D,"delete":0x2E,"backspace":0x08,"enter":0x0D}
+
+def parse_hotkey(hotkey_str: str) -> Optional[Tuple[int, int]]:
+    if not hotkey_str: return None
+    parts = [p.strip().lower() for p in hotkey_str.replace(" ", "").split("+") if p.strip()]
+    if not parts: return None
+    mod = 0; key = None
+    for p in parts:
+        if p in ("ctrl","control"): mod |= MOD_CONTROL
+        elif p=="alt": mod |= MOD_ALT
+        elif p=="shift": mod |= MOD_SHIFT
+        elif p in ("win","super"): mod |= MOD_WIN
+        else: key = p
+    if key is None: return None
+    if len(key)==1 and "a"<=key<="z": vk = ord(key.upper())
+    else: vk = VK_MAP.get(key)
+    if vk is None: return None
+    return (mod, vk)
+
+class GlobalHotkeyThread(threading.Thread):
+    def __init__(self, hotkey_str: str, callback: Callable[[], None]):
+        super().__init__(daemon=True)
+        self._cb = callback
+        self._mod_vk = parse_hotkey(hotkey_str)
+        self._running = threading.Event(); self._running.set()
+        self._tid = None; self._id = 1
+    def run(self):
+        if not self._mod_vk: return
+        user32 = ctypes.windll.user32; kernel32 = ctypes.windll.kernel32
+        self._tid = kernel32.GetCurrentThreadId()
+        mod, vk = self._mod_vk
+        if not user32.RegisterHotKey(None, self._id, mod, vk):
+            return
+        try:
+            msg = ctypes.wintypes.MSG()
+            while self._running.is_set():
+                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret in (0, -1): break
+                if msg.message == WM_HOTKEY and msg.wParam == self._id:
+                    try: self._cb()
+                    except Exception: pass
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            user32.UnregisterHotKey(None, self._id)
+    def stop(self):
+        self._running.clear()
+        if self._tid:
+            ctypes.windll.user32.PostThreadMessageW(self._tid, 0x0000, 0, 0)
 
 # ---- スイッチUI ----
 class SwitchButton(tk.Canvas):
@@ -225,7 +285,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(WINDOW_TITLE); self.resizable(False, False)
-        w, h = 460, 350
+        w, h = 460, 400
         self.geometry(f"{w}x{h}+{(self.winfo_screenwidth()-w)//2}+{(self.winfo_screenheight()-h)//2}")
         self.configure(bg="#FFFFFF")
 
@@ -233,13 +293,10 @@ class App(tk.Tk):
         self.label_status = tk.Label(self, text="状態取得中...", font=("Segoe UI", 16), bg="#FFFFFF")
         self.label_status.pack(pady=(6,10))
 
-        allowed = True
-        try:
-            blocked = rule_exists() and rule_enabled(); allowed = not blocked
-        except Exception as e:
-            self.label_status.config(text=f"状態取得エラー: {e}", fg="#d32f2f")
+        # ★デフォルト表示は常にオンライン（ON/緑）
+        allowed_init = True
 
-        self.switch = SwitchButton(self, width=132, height=70, command=self.on_switch_clicked, initial=allowed)
+        self.switch = SwitchButton(self, width=132, height=70, command=self.on_switch_clicked, initial=allowed_init)
         self.switch.pack(pady=8)
 
         self.loading_var = tk.StringVar(value="")
@@ -254,45 +311,110 @@ class App(tk.Tk):
         self.path_tip = Tooltip(self.label_path, GAME_EXE)
         tk.Button(pf, text="変更", font=("Segoe UI", 9), command=self.on_change_path).pack(side="right", padx=(6,0))
 
-        # --- ホットキー設定 ---
-        hf = tk.Frame(self, bg="#FFFFFF")
-        hf.pack(pady=(4,0), padx=14, fill="x")
+        # ホットキーUI
+        hf = tk.Frame(self, bg="#FFFFFF"); hf.pack(pady=(6,0), padx=14, fill="x")
         tk.Label(hf, text="ショートカット:", font=("Segoe UI", 9, "bold"), fg="#333", bg="#FFFFFF").pack(side="left")
         self.label_hotkey = tk.Label(hf, text=HOTKEY or "未設定", font=("Segoe UI", 9), fg="#555", bg="#FFFFFF")
         self.label_hotkey.pack(side="left", padx=4)
         self.btn_change_hotkey = tk.Button(hf, text="変更", font=("Segoe UI", 9), command=self.on_change_hotkey)
         self.btn_change_hotkey.pack(side="left", padx=6)
-        # --------------------
+        self.label_hotkey_result = tk.Label(self, text="", font=("Segoe UI", 9), fg="#666", bg="#FFFFFF")
+        self.label_hotkey_result.pack(pady=(2, 6))
 
-        tk.Label(self, text="緑＝通信許可（オンライン） / 赤＝通信ブロック（オフライン）\nスペースキーでも切替できます",
+        tk.Label(self, text="緑＝通信許可（オンライン） / 赤＝通信ブロック（オフライン）\nスペースキー/ショートカットでも切替できます",
                  font=("Segoe UI", 9), fg="#666", bg="#FFFFFF", justify="center").pack(pady=(2,8))
 
         self.bind("<space>", lambda e: self.on_switch_clicked(not self.switch.state))
-        self._set_ui_text(allowed=allowed)
-        self._busy = False  # ← 連打防止フラグ
+        self._busy = False
+        self._auto_revert_id: Optional[str] = None  # ★自動復帰の予約ID
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self._g_hotkey_thread: Optional[GlobalHotkeyThread] = None
         self.start_hotkey_listener()
 
+        # デフォ表示→OS実状態へ同期（表示だけ上書き。ファイアウォールは変更しない）
+        self.after(200, self._sync_state_from_os)
+
+    # -------------- ホットキー関連 --------------
     def on_closing(self):
         keyboard.unhook_all()
+        self.stop_hotkey_listener()
         self.destroy()
 
     def toggle_switch(self):
-        # UIスレッドで安全に実行するために after を使う
-        if self._busy: return
+        if self._busy: 
+            return
         self.after(0, self.on_switch_clicked, not self.switch.state)
 
     def start_hotkey_listener(self):
-        global HOTKEY
-        keyboard.unhook_all()
-        if HOTKEY:
-            try:
-                keyboard.add_hotkey(HOTKEY, self.toggle_switch)
-                print(f"[*] ホットキー '{HOTKEY}' を登録しました。")
-            except Exception as e:
-                print(f"[!] ホッ​​トキーの登録に失敗しました: {e}")
+        self.stop_hotkey_listener()
+        if not HOTKEY:
+            self.label_hotkey_result.config(text="（ショートカット未設定）")
+            return
+        if not parse_hotkey(HOTKEY):
+            self.label_hotkey_result.config(text=f"（未対応のキー: {HOTKEY}）")
+            return
+        self._g_hotkey_thread = GlobalHotkeyThread(HOTKEY, lambda: self.toggle_switch())
+        self._g_hotkey_thread.start()
+        self.label_hotkey_result.config(text=f"バックグラウンドで有効: {HOTKEY}")
 
+    def stop_hotkey_listener(self):
+        if self._g_hotkey_thread:
+            try: self._g_hotkey_thread.stop()
+            except Exception: pass
+            self._g_hotkey_thread = None
+
+    def on_change_hotkey(self):
+        global HOTKEY
+        self.btn_change_hotkey.config(state="disabled")
+        win = tk.Toplevel(self); win.title("キー設定"); win.transient(self); win.grab_set()
+        win.geometry(f"300x110+{self.winfo_x()+80}+{self.winfo_y()+100}"); win.resizable(False, False); win.configure(bg="#FAFAFA")
+        tk.Label(win, text="設定したいショートカットキーを押してください...\n(Escでキャンセル)", font=("Segoe UI", 10), bg="#FAFAFA").pack(pady=20, padx=20)
+
+        def cleanup():
+            self.btn_change_hotkey.config(state="normal")
+            try: win.grab_release()
+            except Exception: pass
+            if win.winfo_exists(): win.destroy()
+
+        def record_key():
+            try:
+                new_hotkey = keyboard.read_hotkey(suppress=False)
+                if new_hotkey == 'esc': cleanup(); return
+                HOTKEY = new_hotkey
+                save_config({"hotkey": HOTKEY})
+                self.label_hotkey.config(text=HOTKEY or "未設定")
+                self.start_hotkey_listener()
+            except Exception as e:
+                self.label_hotkey_result.config(text=f"キーの読み取りに失敗: {e}")
+            finally:
+                cleanup()
+
+        win.protocol("WM_DELETE_WINDOW", cleanup)
+        win.after(200, record_key)
+
+    # -------------- 自動復帰関連 --------------
+    def _cancel_auto_revert(self):
+        """予約されている自動復帰を取り消す"""
+        if self._auto_revert_id is not None:
+            try: self.after_cancel(self._auto_revert_id)
+            except Exception: pass
+            self._auto_revert_id = None
+
+    def _schedule_auto_revert(self):
+        """OFF→5秒後にONへ戻す。処理中なら落ち着くまで再試行。"""
+        self._cancel_auto_revert()
+        def _auto_revert():
+            if self._busy:
+                # ビジーなら少し待ってリトライ
+                self._auto_revert_id = self.after(500, _auto_revert)
+                return
+            self._auto_revert_id = None
+            # ONへ
+            self.on_switch_clicked(True)
+        self._auto_revert_id = self.after(AUTO_REVERT_MS, _auto_revert)
+
+    # -------------- UI/処理 --------------
     def _set_ui_text(self, allowed: bool, note: str = ""):
         if allowed:
             self.label_status.config(text="通信：許可中（オンライン）" + (f" / {note}" if note else ""), fg="#2e7d32")
@@ -308,7 +430,6 @@ class App(tk.Tk):
         self.config(cursor="watch")
 
     def _stop_loading(self):
-        # ★重要：ロック解除をここで必ず実施
         self._busy = False
         self.switch.set_disabled(False)
         self.progress.stop()
@@ -320,75 +441,40 @@ class App(tk.Tk):
         self.label_path.config(text=ellipsize_middle(GAME_EXE, MAX_PATH_CHARS))
         self.path_tip.set_text(GAME_EXE)
 
+    def _sync_state_from_os(self):
+        """起動直後に一度だけ、実OS状態にUIを同期（表示のみ）。"""
+        try:
+            real_blocked = rule_exists() and rule_enabled()
+            allowed_now = not real_blocked
+            self.switch.set_state(allowed_now)
+            self._set_ui_text(allowed=allowed_now)
+        except Exception:
+            pass
+
     def on_change_path(self):
         global GAME_EXE
         path = filedialog.askopenfilename(title="MonsterHunterWilds.exe を選択",
                                           filetypes=[("実行ファイル","*.exe"), ("すべてのファイル","*.*")])
         if not path: return
-        
-        # パスの区切り文字を \ に統一する
         GAME_EXE = os.path.normpath(path)
-        
         save_config({"game_exe": GAME_EXE})
         self._refresh_path_label()
-        
-        # 現在ブロック中なら、新しいパスでルールを再適用する
         try:
             if rule_exists() and rule_enabled():
                 ok, err = create_or_replace_block_rule()
                 if not ok:
-                    messagebox.showwarning("注意", f"新しいパスでブロックルールの再作成に失敗しました。\n{err.strip()}")
+                    messagebox.showwarning("注意", f"新しいパスでブロックルールの再作成に失敗しました。\n{(err or '').strip()}")
         except Exception as e:
             messagebox.showwarning("注意", f"ルール更新中にエラーが発生しました。\n{e}")
 
-    def on_change_hotkey(self):
-        global HOTKEY
-        
-        self.btn_change_hotkey.config(state="disabled")
-
-        win = tk.Toplevel(self)
-        win.title("キー設定")
-        win.transient(self)
-        win.grab_set()
-        win.geometry(f"300x100+{self.winfo_x()+80}+{self.winfo_y()+100}")
-        win.resizable(False, False)
-        win.configure(bg="#FAFAFA")
-
-        lbl = tk.Label(win, text="設定したいショートカットキーを押してください...\n(Escでキャンセル)", font=("Segoe UI", 10), bg="#FAFAFA")
-        lbl.pack(pady=20, padx=20)
-
-        def cleanup():
-            self.btn_change_hotkey.config(state="normal")
-            if win.winfo_exists():
-                win.grab_release()
-                win.destroy()
-
-        def record_key():
-            try:
-                new_hotkey = keyboard.read_hotkey(suppress=False)
-                print(f"[*] キーを検出: {new_hotkey}")
-                
-                if new_hotkey == 'esc':
-                    cleanup()
-                    return
-
-                HOTKEY = new_hotkey
-                save_config({"hotkey": HOTKEY})
-                self.label_hotkey.config(text=HOTKEY or "未設定")
-                self.start_hotkey_listener()
-            except Exception as e:
-                print(f"[!] キーの読み取りに失敗: {e}")
-            finally:
-                cleanup()
-
-        win.protocol("WM_DELETE_WINDOW", cleanup)
-        win.after(200, record_key)
-
     def on_switch_clicked(self, want_allowed: bool):
+        # ONに戻す操作が来たら自動復帰の予約はキャンセル
+        if want_allowed:
+            self._cancel_auto_revert()
+
         if self._busy: return
-        # GUI操作の直前にチェック
         if not GAME_EXE or not GAME_EXE.lower().endswith(".exe"):
-            messagebox.showerror("設定エラー", "対象の実行ファイルが設定されていないか、.exe ファイルではありません。『変更』から選択してください。")
+            messagebox.showerror("設定エラー", "対象の実行ファイルが設定されていないか、.exeではありません。『変更』から選択してください。")
             return
 
         self._start_loading("処理中…数秒お待ちください")
@@ -413,10 +499,14 @@ class App(tk.Tk):
                     allowed_now = want_allowed
 
                 if not ok:
-                    messagebox.showerror("エラー", f"切替に失敗しました。\n\n詳細：\n{err_detail.strip()}" if err_detail else "切替に失敗しました。")
-                
+                    messagebox.showerror("エラー", f"切替に失敗しました。\n\n詳細：\n{(err_detail or '').strip()}" if err_detail else "切替に失敗しました。")
+
                 self.switch.set_state(allowed_now, animate=True)
                 self._set_ui_text(allowed=allowed_now)
+
+                # ★OFFにできていたら自動復帰を予約、ONなら予約は不要＆キャンセル済み
+                if ok and not allowed_now:
+                    self._schedule_auto_revert()
 
             self.after(0, finish)
 
@@ -430,15 +520,12 @@ def main():
     except Exception:
         return
     try:
-        # PowerShellが利用可能かチェック
-        result = subprocess.run(
+        subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Write-Host 'OK'"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             encoding="utf-8"
         )
-        if result.returncode != 0 or "OK" not in result.stdout:
-             raise FileNotFoundError("PowerShellが正常に動作しません。")
     except FileNotFoundError:
         messagebox.showerror("エラー", "PowerShell が見つからないか、正常に動作しません。"); return
 
