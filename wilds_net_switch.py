@@ -8,11 +8,12 @@ Wilds Net Switch - Monster Hunter Wilds の通信をワンクリックでON/OFF
 
 import sys, os, json, subprocess, threading, locale, tkinter as tk
 from tkinter import messagebox, filedialog, ttk
-import ctypes
+import ctypes, keyboard
 from typing import Callable
 
 # ===== 設定 =====
 DEFAULT_GAME_EXE = r""
+DEFAULT_HOTKEY = ""
 RULE_NAME = "BlockWilds_WildsOutbound"
 WINDOW_TITLE = "Wilds Net Switch"
 MAX_PATH_CHARS = 56
@@ -27,6 +28,7 @@ CONFIG_PATH = os.path.join(_app_dir(), "WildsNetSwitch.config.json")
 
 def load_config() -> dict:
     try:
+        if not os.path.exists(CONFIG_PATH): return {}
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
@@ -34,12 +36,16 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     try:
+        full_cfg = load_config()
+        full_cfg.update(cfg)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json.dump(full_cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-GAME_EXE = load_config().get("game_exe", DEFAULT_GAME_EXE)
+config = load_config()
+GAME_EXE = config.get("game_exe", DEFAULT_GAME_EXE)
+HOTKEY = config.get("hotkey", DEFAULT_HOTKEY)
 
 # ---- PowerShell / Firewall ----
 def is_admin() -> bool:
@@ -214,7 +220,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(WINDOW_TITLE); self.resizable(False, False)
-        w, h = 460, 310
+        w, h = 460, 350
         self.geometry(f"{w}x{h}+{(self.winfo_screenwidth()-w)//2}+{(self.winfo_screenheight()-h)//2}")
         self.configure(bg="#FFFFFF")
 
@@ -243,12 +249,44 @@ class App(tk.Tk):
         self.path_tip = Tooltip(self.label_path, GAME_EXE)
         tk.Button(pf, text="変更", font=("Segoe UI", 9), command=self.on_change_path).pack(side="right", padx=(6,0))
 
+        # --- ホットキー設定 ---
+        hf = tk.Frame(self, bg="#FFFFFF")
+        hf.pack(pady=(4,0), padx=14, fill="x")
+        tk.Label(hf, text="ショートカット:", font=("Segoe UI", 9, "bold"), fg="#333", bg="#FFFFFF").pack(side="left")
+        self.label_hotkey = tk.Label(hf, text=HOTKEY or "未設定", font=("Segoe UI", 9), fg="#555", bg="#FFFFFF")
+        self.label_hotkey.pack(side="left", padx=4)
+        self.btn_change_hotkey = tk.Button(hf, text="変更", font=("Segoe UI", 9), command=self.on_change_hotkey)
+        self.btn_change_hotkey.pack(side="left", padx=6)
+        # --------------------
+
         tk.Label(self, text="緑＝通信許可（オンライン） / 赤＝通信ブロック（オフライン）\nスペースキーでも切替できます",
                  font=("Segoe UI", 9), fg="#666", bg="#FFFFFF", justify="center").pack(pady=(2,8))
 
         self.bind("<space>", lambda e: self.on_switch_clicked(not self.switch.state))
         self._set_ui_text(allowed=allowed)
         self._busy = False  # ← 連打防止フラグ
+
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.start_hotkey_listener()
+
+    def on_closing(self):
+        keyboard.remove_all_hotkeys()
+        self.destroy()
+
+    def toggle_switch(self):
+        # UIスレッドで安全に実行するために after を使う
+        if self._busy: return
+        self.after(0, self.on_switch_clicked, not self.switch.state)
+
+    def start_hotkey_listener(self):
+        global HOTKEY
+        keyboard.remove_all_hotkeys()
+        if HOTKEY:
+            try:
+                keyboard.add_hotkey(HOTKEY, self.toggle_switch)
+                print(f"[*] ホットキー '{HOTKEY}' を登録しました。")
+            except Exception as e:
+                print(f"[!] ホッ​​トキーの登録に失敗しました: {e}")
 
     def _set_ui_text(self, allowed: bool, note: str = ""):
         if allowed:
@@ -289,6 +327,50 @@ class App(tk.Tk):
                     messagebox.showwarning("注意", "新しいパスでブロックルールの再作成に失敗しました。")
         except Exception as e:
             messagebox.showwarning("注意", f"ルール更新中にエラーが発生しました。\n{e}")
+
+    def on_change_hotkey(self):
+        global HOTKEY
+        
+        self.btn_change_hotkey.config(state="disabled")
+
+        win = tk.Toplevel(self)
+        win.title("キー設定")
+        win.transient(self)
+        win.grab_set()
+        win.geometry(f"300x100+{self.winfo_x()+80}+{self.winfo_y()+100}")
+        win.resizable(False, False)
+        win.configure(bg="#FAFAFA")
+
+        lbl = tk.Label(win, text="設定したいショートカットキーを押してください...\n(Escでキャンセル)", font=("Segoe UI", 10), bg="#FAFAFA")
+        lbl.pack(pady=20, padx=20)
+
+        def cleanup():
+            self.btn_change_hotkey.config(state="normal")
+            if win.winfo_exists():
+                win.grab_release()
+                win.destroy()
+
+        def record_key():
+            try:
+                new_hotkey = keyboard.read_hotkey(suppress=False)
+                print(f"[*] キーを検出: {new_hotkey}")
+                
+                if new_hotkey == 'esc':
+                    cleanup()
+                    return
+
+                HOTKEY = new_hotkey
+                save_config({"hotkey": HOTKEY})
+                self.label_hotkey.config(text=HOTKEY or "未設定")
+                self.start_hotkey_listener()
+            except Exception as e:
+                print(f"[!] キーの読み取りに失敗: {e}")
+            finally:
+                cleanup()
+
+        win.protocol("WM_DELETE_WINDOW", cleanup)
+        win.after(200, record_key)
+
 
     def on_switch_clicked(self, want_allowed: bool):
         if self._busy: return
