@@ -270,7 +270,7 @@ class App(tk.Tk):
         self.start_hotkey_listener()
 
     def on_closing(self):
-        keyboard.remove_all_hotkeys()
+        keyboard.unhook_all()
         self.destroy()
 
     def toggle_switch(self):
@@ -280,7 +280,7 @@ class App(tk.Tk):
 
     def start_hotkey_listener(self):
         global HOTKEY
-        keyboard.remove_all_hotkeys()
+        keyboard.unhook_all()
         if HOTKEY:
             try:
                 keyboard.add_hotkey(HOTKEY, self.toggle_switch)
